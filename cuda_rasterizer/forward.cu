@@ -15,7 +15,6 @@
 #include <cooperative_groups/reduce.h>
 
 // ⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️
-// 新添加
 #include "statistical_constants.cuh"
 // ⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️
 
@@ -79,19 +78,24 @@ __device__ glm::vec3 computeColorFromSH(int idx, int deg, int max_coeffs, const 
 
 
 
+struct MeanCov2D {
+    float2 mean;   // (μx, μy)
+    float3 cov;    // (σx², cov_xy, σy²)
+};
+
 // -----------------------------------------------------------------------------
-//  Statistical linearization version (sampling) : 3D  -> 2D covariance
+// computeMeanCov2D_statistical: Statistical sampling of 2D mean & covariance
 // -----------------------------------------------------------------------------
-__device__ float3 computeCov2D(const float3& mean_world,
-                               float focal_x, float focal_y,
-                               float tan_fovx, float tan_fovy,
-                               const float* cov3D,      // packed Σ3D (6 floats)
-                               const float* viewmatrix) // 4×4 row-major
+__device__ MeanCov2D computeMeanCov2D_statistical(const float3& mean_world,
+                                                 float focal_x, float focal_y,
+                                                 float tan_fovx, float tan_fovy,
+                                                 const float* cov3D,      // packed Σ3D (6 floats)
+                                                 const float* viewmatrix) // 4×4 row-major
 {
-    //---------------- 1. 把高斯中心变到相机坐标 ----------------
+	//---------------- 1. Transform Gaussian center to camera coordinates ----------------
     float3 mu_cam = transformPoint4x3(mean_world, viewmatrix);
 
-    // 视锥裁剪（与原代码一致，防止过大协方差）
+    // Frustum culling (same as original code, to prevent excessively large covariance)
     const float limx = 1.3f * tan_fovx;
     const float limy = 1.3f * tan_fovy;
     float px = mu_cam.x / mu_cam.z;
@@ -101,7 +105,7 @@ __device__ float3 computeCov2D(const float3& mean_world,
     mu_cam.x = px * mu_cam.z;
     mu_cam.y = py * mu_cam.z;
 
-    //---------------- 2. Σ3D 由世界 → 相机 ----------------
+	//---------------- 2. Σ3D from world → camera ----------------
     glm::mat3 Σw(cov3D[0], cov3D[1], cov3D[2],
                  cov3D[1], cov3D[3], cov3D[4],
                  cov3D[2], cov3D[4], cov3D[5]);
@@ -112,7 +116,7 @@ __device__ float3 computeCov2D(const float3& mean_world,
 
     glm::mat3 Σc = W * Σw * glm::transpose(W);     // camera-space 3×3
 
-    //---------------- 3. Cholesky : Σc = L·Lᵀ ---------------
+   //---------------- 3. Cholesky : Σc = L·Lᵀ ---------------
     glm::mat3 L(0.0f);
     L[0][0] = sqrtf(Σc[0][0] + 1e-6f);
     L[1][0] = Σc[1][0] / L[0][0];
@@ -121,14 +125,13 @@ __device__ float3 computeCov2D(const float3& mean_world,
     L[2][1] = (Σc[2][1] - L[2][0]*L[1][0]) / L[1][1];
     L[2][2] = sqrtf(Σc[2][2] - L[2][0]*L[2][0] - L[2][1]*L[2][1] + 1e-6f);
 
-    //---------------- 4. 采样 → 投影 -------------------------
+	//---------------- 4. Sampling → Projection -------------------------
     const int N = NUM_STD_SAMPLES;
     double sx = 0., sy = 0., sx2 = 0., sy2 = 0., sxy = 0.;
 
     #pragma unroll
     for (int i = 0; i < N; ++i)
     {
-        // 4.1 把常量内存里的标准样本变成 3D 高斯样本（相机坐标）
         float s0 = BASE_SAMPLES_MAX[3*i + 0];
         float s1 = BASE_SAMPLES_MAX[3*i + 1];
         float s2 = BASE_SAMPLES_MAX[3*i + 2];
@@ -140,16 +143,16 @@ __device__ float3 computeCov2D(const float3& mean_world,
 
         float3 p_cam = { mu_cam.x + d.x, mu_cam.y + d.y, mu_cam.z + d.z };
 
-        // 4.2 透视除法 (非线性)
+        // 4.2 Perspective division (nonlinear)
         float ndc_x = p_cam.x / p_cam.z;
         float ndc_y = p_cam.y / p_cam.z;
         ndc_x = fminf(limx, fmaxf(-limx, ndc_x));
         ndc_y = fminf(limy, fmaxf(-limy, ndc_y));
 
-        float img_x = focal_x * ndc_x;   // 转像素坐标
+        float img_x = focal_x * ndc_x;   // Convert to pixel coordinates
         float img_y = focal_y * ndc_y;
 
-        // 累加一阶 / 二阶矩
+        // momeent matching
         sx  += img_x;
         sy  += img_y;
         sx2 += img_x * img_x;
@@ -157,89 +160,22 @@ __device__ float3 computeCov2D(const float3& mean_world,
         sxy += img_x * img_y;
     }
 
-    //---------------- 5. 样本均值 & 协方差 --------------------
-    double mx = sx  / N;
-    double my = sy  / N;
-    double vx = sx2 / N - mx*mx;
-    double vy = sy2 / N - my*my;
-    double cxy= sxy / N - mx*my;
+	//---------------- 5. Sample mean & covariance --------------------
+    double mx  = sx  / N;
+    double my  = sy  / N;
+    double vx  = sx2 / N - mx*mx;
+    double vy  = sy2 / N - my*my;
+    double cxy = sxy / N - mx*my;
 
-    // 与原算法保持一致，确保最小 ~1 像素宽
+    // Consistent with original algorithm, ensure a minimum width of ~1 pixel
     vx += 0.3;
     vy += 0.3;
 
-    return { (float)vx, (float)cxy, (float)vy };   // σₓ², cov, σᵧ²
+    MeanCov2D result;
+    result.mean = { (float)mx,  (float)my  };
+    result.cov  = { (float)vx,  (float)cxy, (float)vy };
+    return result;
 }
-
-// -----------------------------------------------------------------------------
-//  computeMean2D_statistical : 采样统计高斯投影中心（mean）
-//  参数与 computeCov2D 完全一致，只返回 float2 (mean_x, mean_y)
-// -----------------------------------------------------------------------------
-__device__ float2 computeMean2D_statistical(const float3& mean_world,
-                                            float focal_x, float focal_y,
-                                            float tan_fovx, float tan_fovy,
-                                            const float* cov3D,          // 6 floats
-                                            const float* viewmatrix)     // 4×4 row-major
-{
-    //——— 1. 世界 → 相机 -------------------------------------------------------
-    float3 mu_cam = transformPoint4x3(mean_world, viewmatrix);
-
-    //——— 2. Σ3D 世界 → 相机 --------------------------------------------------
-    glm::mat3 Σw(cov3D[0], cov3D[1], cov3D[2],
-                 cov3D[1], cov3D[3], cov3D[4],
-                 cov3D[2], cov3D[4], cov3D[5]);
-
-    glm::mat3 W(viewmatrix[0], viewmatrix[4], viewmatrix[8],
-                viewmatrix[1], viewmatrix[5], viewmatrix[9],
-                viewmatrix[2], viewmatrix[6], viewmatrix[10]);
-    glm::mat3 Σc = W * Σw * glm::transpose(W);
-
-    //——— 3. Cholesky : Σc = L·Lᵀ --------------------------------------------
-    glm::mat3 L(0.0f);
-    L[0][0] = sqrtf(Σc[0][0] + 1e-6f);
-    L[1][0] = Σc[1][0] / L[0][0];
-    L[2][0] = Σc[2][0] / L[0][0];
-    L[1][1] = sqrtf(Σc[1][1] - L[1][0]*L[1][0] + 1e-6f);
-    L[2][1] = (Σc[2][1] - L[2][0]*L[1][0]) / L[1][1];
-    L[2][2] = sqrtf(Σc[2][2] - L[2][0]*L[2][0] - L[2][1]*L[2][1] + 1e-6f);
-
-    //——— 4. 采样 → 非线性投影 → 统计一阶矩 -----------------------------------
-    const int N = NUM_STD_SAMPLES;            // =100，见 statistical_samples.cuh
-    const float limx = 1.3f * tan_fovx;       // 与原库保持一致
-    const float limy = 1.3f * tan_fovy;
-
-    double sum_x = 0.0, sum_y = 0.0;
-
-    #pragma unroll
-    for (int si = 0; si < N; ++si)
-    {
-        float s0 = BASE_SAMPLES_MAX[3*si + 0];
-        float s1 = BASE_SAMPLES_MAX[3*si + 1];
-        float s2 = BASE_SAMPLES_MAX[3*si + 2];
-
-        float3 dev;
-        dev.x = L[0][0]*s0;
-        dev.y = L[1][0]*s0 + L[1][1]*s1;
-        dev.z = L[2][0]*s0 + L[2][1]*s1 + L[2][2]*s2;
-
-        float3 p_cam = { mu_cam.x + dev.x,
-                         mu_cam.y + dev.y,
-                         mu_cam.z + dev.z };
-
-        float ndc_x = p_cam.x / p_cam.z;
-        float ndc_y = p_cam.y / p_cam.z;
-        ndc_x = fminf(limx, fmaxf(-limx, ndc_x));
-        ndc_y = fminf(limy, fmaxf(-limy, ndc_y));
-
-        sum_x += focal_x * ndc_x;    // 投影到像素坐标
-        sum_y += focal_y * ndc_y;
-    }
-
-    return { float(sum_x / N), float(sum_y / N) };
-}
-
-
-
 
 
 // Forward method for converting scale and rotation properties of each
@@ -297,17 +233,20 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	const float* projmatrix,
 	const glm::vec3* cam_pos,
 	const int W, int H,
-	const float tan_fovx, float tan_fovy,
 	const float focal_x, float focal_y,
+	const float tan_fovx, float tan_fovy,
 	int* radii,
 	float2* points_xy_image,
 	float* depths,
 	float* cov3Ds,
-	float* rgb,
+	float* colors,  
 	float4* conic_opacity,
 	const dim3 grid,
+	bool antialiasing,
 	uint32_t* tiles_touched,
-	bool prefiltered)
+	bool prefiltered,
+	const bool use_proj_mean   // 🆕 Select mean calculation method
+	)
 {
 	auto idx = cg::this_grid().thread_rank();
 	if (idx >= P)
@@ -323,17 +262,14 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	if (!in_frustum(idx, orig_points, viewmatrix, projmatrix, prefiltered, p_view))
 		return;
 
-	// ⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️
-	// 使用computeMean2D_statistical 返回{像素 x, 像素 y}，之后赋值给 points_xy_image[idx]；
-	float2 mean2D = computeMean2D_statistical(
-		/*mean_world=*/ p_orig,
-		focal_x, focal_y,
-		tan_fovx, tan_fovy,
-		cov3D,             // 同 computeCov2D 用的那个指针
-		viewmatrix         // 视图矩阵
-		);
-	// ⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️
+	// 1) Read Gaussian center in world space from orig_points
+	float3 p_orig = make_float3(
+		orig_points[3 * idx + 0],
+		orig_points[3 * idx + 1],
+		orig_points[3 * idx + 2]
+	);
 
+	// 2) Compute covariance subarray (6 elements) pointing to the current Gaussian
 	// If 3D covariance matrix is precomputed, use it, otherwise compute
 	// from scaling and rotation parameters. 
 	const float* cov3D;
@@ -346,12 +282,41 @@ __global__ void preprocessCUDA(int P, int D, int M,
 		computeCov3D(scales[idx], scale_modifier, rotations[idx], cov3Ds + idx * 6);
 		cov3D = cov3Ds + idx * 6;
 	}
+	// ⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️
+	// ✨ Use the new computeMeanCov2D_statistical to obtain mean2D and covariance
+    MeanCov2D mc = computeMeanCov2D_statistical(
+        /*mean_world=*/ p_orig,
+        focal_x, focal_y,
+        tan_fovx, tan_fovy,
+        cov3D,
+        viewmatrix
+    );
+    float2 mean2D; // mean2D will be assigned to points_xy_image[idx] later;
+    float3 cov    = mc.cov;
 
-	// Compute 2D screen-space covariance matrix
-	float3 cov = computeCov2D(p_orig, focal_x, focal_y, tan_fovx, tan_fovy, cov3D, viewmatrix);
+	if (use_proj_mean) {
+        // Compatible with the projection method of original one
+        float4 p_hom = transformPoint4x4(p_orig, projmatrix);
+        float inv_w  = 1.0f / (p_hom.w + 1e-7f);
+        float3 p_proj = { p_hom.x * inv_w, p_hom.y * inv_w, p_hom.z * inv_w };
+        mean2D = make_float2(ndc2Pix(p_proj.x, W), ndc2Pix(p_proj.y, H));
+    } else {
+        mean2D = mc.mean;
+    }
+	// ⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️
 
+
+	float raw_x = cov.x - 0.3f;
+	float raw_z = cov.z - 0.3f;
 	// Invert covariance (EWA algorithm)
+	float det_cov       = raw_x * raw_z - cov.y * cov.y;
 	float det = (cov.x * cov.z - cov.y * cov.y);
+	float h_scaling = 1.0f;
+	
+	if (antialiasing) {
+		h_scaling = sqrtf(max(2.5e-5f, det_cov / det));
+	}
+	
 	if (det == 0.0f)
 		return;
 	float det_inv = 1.f / det;
@@ -365,10 +330,10 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	float lambda1 = mid + sqrt(max(0.1f, mid * mid - det));
 	float lambda2 = mid - sqrt(max(0.1f, mid * mid - det));
 	float my_radius = ceil(3.f * sqrt(max(lambda1, lambda2)));
-	// ⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️
-	
-	// ⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️
 	uint2 rect_min, rect_max;
+
+	float2 point_image = mean2D;
+	
 	getRect(point_image, my_radius, rect_min, rect_max, grid);
 	if ((rect_max.x - rect_min.x) * (rect_max.y - rect_min.y) == 0)
 		return;
@@ -378,9 +343,9 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	if (colors_precomp == nullptr)
 	{
 		glm::vec3 result = computeColorFromSH(idx, D, M, (glm::vec3*)orig_points, *cam_pos, shs, clamped);
-		rgb[idx * C + 0] = result.x;
-		rgb[idx * C + 1] = result.y;
-		rgb[idx * C + 2] = result.z;
+		colors[idx * C + 0] = result.x;
+		colors[idx * C + 1] = result.y;
+		colors[idx * C + 2] = result.z;
 	}
 
 	// Store some useful helper data for the next steps.
@@ -390,7 +355,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	points_xy_image[idx] = mean2D;
 	// ⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️
 	// Inverse 2D covariance and opacity neatly pack into one float4
-	conic_opacity[idx] = { conic.x, conic.y, conic.z, opacities[idx] };
+	conic_opacity[idx] = { conic.x, conic.y, conic.z, opacities[idx] * h_scaling};
 	tiles_touched[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x);
 }
 
@@ -555,14 +520,16 @@ void FORWARD::preprocess(int P, int D, int M,
 	const float focal_x, float focal_y,
 	const float tan_fovx, float tan_fovy,
 	int* radii,
-	float2* means2D,
+	float2* points_xy_image,
 	float* depths,
 	float* cov3Ds,
-	float* rgb,
+	float* colors,
 	float4* conic_opacity,
 	const dim3 grid,
+	bool antialiasing,
 	uint32_t* tiles_touched,
-	bool prefiltered)
+	bool prefiltered,
+	const bool use_proj_mean)
 {
 	preprocessCUDA<NUM_CHANNELS> << <(P + 255) / 256, 256 >> > (
 		P, D, M,
@@ -579,16 +546,18 @@ void FORWARD::preprocess(int P, int D, int M,
 		projmatrix,
 		cam_pos,
 		W, H,
-		tan_fovx, tan_fovy,
 		focal_x, focal_y,
+		tan_fovx, tan_fovy,
 		radii,
-		means2D,
+		points_xy_image,
 		depths,
 		cov3Ds,
-		rgb,
+		colors,
 		conic_opacity,
 		grid,
+		antialiasing,
 		tiles_touched,
-		prefiltered
+		prefiltered,
+		use_proj_mean
 		);
 }

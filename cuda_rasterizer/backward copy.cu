@@ -138,66 +138,6 @@ __device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::
 	dL_dmeans[idx] += glm::vec3(dL_dmean.x, dL_dmean.y, dL_dmean.z);
 }
 
-
-// -------- helpers for SL --------
-__device__ __forceinline__ void cholesky3x3(const glm::mat3& A, glm::mat3& L)
-{
-    // A 对称正定 → L 下三角；跟 forward 一致
-    const float eps = 1e-6f;
-    L[0][0] = sqrtf(fmaxf(A[0][0], eps));
-    L[1][0] = A[1][0] / L[0][0];
-    L[2][0] = A[2][0] / L[0][0];
-
-    float t11 = A[1][1] - L[1][0]*L[1][0];
-    L[1][1] = sqrtf(fmaxf(t11, eps));
-    L[2][1] = (A[2][1] - L[2][0]*L[1][0]) / L[1][1];
-
-    float t22 = A[2][2] - L[2][0]*L[2][0] - L[2][1]*L[2][1];
-    L[2][2] = sqrtf(fmaxf(t22, eps));
-
-    // 其余上三角清零
-    L[0][1]=L[0][2]=L[1][2]=0.f;
-}
-
-__device__ __forceinline__ glm::vec3 lowerTriMul(const glm::mat3& L, const glm::vec3& z)
-{
-    // L 下三角 × 向量 z
-    return glm::vec3(
-        L[0][0]*z.x,
-        L[1][0]*z.x + L[1][1]*z.y,
-        L[2][0]*z.x + L[2][1]*z.y + L[2][2]*z.z
-    );
-}
-
-// —— 帮手：在透视投影中同时做 clamp 和 mask —— 
-__device__ __forceinline__ void projectPerspMasked(
-	const glm::vec3& x,
-	const float  h_x, const float  h_y,
-	const float  limx, const float  limy,
-	float& u,    float& v,
-	glm::mat2x3& J)
-{
-// pre‐clamp 坐标
-float px = x.x * (1.f / x.z);
-float py = x.y * (1.f / x.z);
-
-// mask factor：超出视锥外，梯度置 0
-float xm = (px < -limx || px > limx) ? 0.f : 1.f;
-float ym = (py < -limy || py > limy) ? 0.f : 1.f;
-
-// clamp 后再乘焦距
-float cpx = fminf(fmaxf(px, -limx), limx);
-float cpy = fminf(fmaxf(py, -limy), limy);
-u = h_x * cpx;
-v = h_y * cpy;
-
-// Jacobian 并打上 mask
-float invZ = 1.f / x.z, invZ2 = invZ * invZ;
-J[0][0] =  h_x * invZ   * xm;  J[0][1] = 0.f;               J[0][2] = -h_x * x.x * invZ2 * xm;
-J[1][0] = 0.f;                 J[1][1] =  h_y * invZ   * ym; J[1][2] = -h_y * x.y * invZ2 * ym;
-}
-
-
 // Backward version of INVERSE 2D covariance matrix computation
 // (due to length launched as separate kernel before other 
 // backward steps contained in preprocess)
@@ -216,173 +156,121 @@ __global__ void computeCov2DCUDA(int P,
 	if (idx >= P || !(radii[idx] > 0))
 		return;
 
-	// 0) read Σ_w, μ_w
-	const float3 mu_w = means[idx];
+	// Reading location of 3D covariance for this Gaussian
 	const float* cov3D = cov3Ds + 6 * idx;
-	glm::mat3 Σw(
-        cov3D[0], cov3D[1], cov3D[2],
-        cov3D[1], cov3D[3], cov3D[4],
-        cov3D[2], cov3D[4], cov3D[5]
-    );
 
+	// Fetch gradients, recompute 2D covariance and relevant 
+	// intermediate forward results needed in the backward.
+	float3 mean = means[idx];
 	float3 dL_dconic = { dL_dconics[4 * idx], dL_dconics[4 * idx + 1], dL_dconics[4 * idx + 3] };
+	float3 t = transformPoint4x3(mean, view_matrix);
+	
+	const float limx = 1.3f * tan_fovx;
+	const float limy = 1.3f * tan_fovy;
+	const float txtz = t.x / t.z;
+	const float tytz = t.y / t.z;
+	t.x = min(limx, max(-limx, txtz)) * t.z;
+	t.y = min(limy, max(-limy, tytz)) * t.z;
+	
+	const float x_grad_mul = txtz < -limx || txtz > limx ? 0 : 1;
+	const float y_grad_mul = tytz < -limy || tytz > limy ? 0 : 1;
 
-	//--------------------------------------------------
-    // 1) world → camera
-    //--------------------------------------------------
-	float3 mu_cam = transformPoint4x3(mu_w, view_matrix); //μ_c
+	glm::mat3 J = glm::mat3(h_x / t.z, 0.0f, -(h_x * t.x) / (t.z * t.z),
+		0.0f, h_y / t.z, -(h_y * t.y) / (t.z * t.z),
+		0, 0, 0);
 
-    glm::mat3 W(
-        view_matrix[0], view_matrix[4], view_matrix[8],
-        view_matrix[1], view_matrix[5], view_matrix[9],
-        view_matrix[2], view_matrix[6], view_matrix[10]
-    );
-	glm::mat3 Σc = W * Σw * glm::transpose(W);  // Σ_c
+	glm::mat3 W = glm::mat3(
+		view_matrix[0], view_matrix[4], view_matrix[8],
+		view_matrix[1], view_matrix[5], view_matrix[9],
+		view_matrix[2], view_matrix[6], view_matrix[10]);
 
-	//--------------------------------------------------
-    // 2) Cholesky Σ_c = L Lᵀ
-    //--------------------------------------------------
-    glm::mat3 L;
-    cholesky3x3(Σc, L);
+	glm::mat3 Vrk = glm::mat3(
+		cov3D[0], cov3D[1], cov3D[2],
+		cov3D[1], cov3D[3], cov3D[4],
+		cov3D[2], cov3D[4], cov3D[5]);
 
-	//--------------------------------------------------
-    // 3) moment matching（均值 + 协方差）
-    //--------------------------------------------------
-	// 预计算常量
-    const float limx = 1.3f * tan_fovx;
-    const float limy = 1.3f * tan_fovy;
-    const float invN = 1.f / float(N_SAMPLES);
+	glm::mat3 T = W * J;
 
-	float sum_u = 0.f, sum_v = 0.f;
-	float sum_uu = 0.f, sum_uv = 0.f, sum_vv = 0.f;
+	glm::mat3 cov2D = glm::transpose(T) * glm::transpose(Vrk) * T;
 
-	#pragma unroll
-	for (int s = 0; s < N_SAMPLES; ++s) {
-		// 1) xi = mu_c + L z_i
-		glm::vec3 x = mu_c + lowerTriMul(L, STANDARD_NORMAL_SAMPLES[s]);
+	// Use helper variables for 2D covariance entries. More compact.
+	float a = cov2D[0][0] += 0.3f;
+	float b = cov2D[0][1];
+	float c = cov2D[1][1] += 0.3f;
 
-		// 2) yi = p(xi) 并做 mask & clamp
-		float u, v; glm::mat2x3 J;
-		projectPerspMasked(x, h_x, h_y, limx, limy, u, v, J);
-
-		// 3) 累加一阶矩与二阶矩
-		sum_u  += u;
-		sum_v  += v;
-		sum_uu += u * u;
-		sum_uv += u * v;
-		sum_vv += v * v;
-	}
-
-	//--------------------------------------------------
-	// 4) 从累加的矩阵量计算 μ2d 和 Σ2d：mean2d = (u_bar, v_bar)， cov2d = (a, b, c)
-	//--------------------------------------------------
-	const float invN = 1.f / float(N_SAMPLES);
-	float u_bar = sum_u * invN;            // E[u]
-	float v_bar = sum_v * invN;            // E[v]
-
-	// E[u²], E[uv], E[v²]
-	float eu2 = sum_uu * invN;
-	float euv = sum_uv * invN;
-	float ev2 = sum_vv * invN;
-
-	// 方差与协方差
-	float a = eu2 - u_bar * u_bar + 0.3f;   // σ_x² + ε
-	float b = euv - u_bar * v_bar;          // cov_xy
-	float c = ev2 - v_bar * v_bar + 0.3f;   // σ_y² + ε
-
-	//--------------------------------------------------
-	// 5) conic→(a,b,c) 的反传 
-	//--------------------------------------------------
 	float denom = a * c - b * b;
 	float dL_da = 0, dL_db = 0, dL_dc = 0;
 	float denom2inv = 1.0f / ((denom * denom) + 0.0000001f);
 
-	// 从 conic 提取 loss 梯度
-	float3 dL_dconic = { dL_dconics[4*idx],
-						dL_dconics[4*idx+1],
-						dL_dconics[4*idx+3] };
-
 	if (denom2inv != 0)
 	{
-		// ∂L/∂a = ∂L/∂A · ∂A/∂a + ∂L/∂B · ∂B/∂a + ∂L/∂C · ∂C/∂a
-		dL_da = denom2inv * (
-			-c*c * dL_dconic.x     // ∂A/∂a = -c² / denom²
-		+ 2*b*c * dL_dconic.y   // ∂B/∂a =  2bc / denom²
-		+ (denom - a*c) * dL_dconic.z  // ∂C/∂a = (denom - ac)/denom²
-		);
+		// Gradients of loss w.r.t. entries of 2D covariance matrix,
+		// given gradients of loss w.r.t. conic matrix (inverse covariance matrix).
+		// e.g., dL / da = dL / d_conic_a * d_conic_a / d_a
+		dL_da = denom2inv * (-c * c * dL_dconic.x + 2 * b * c * dL_dconic.y + (denom - a * c) * dL_dconic.z);
+		dL_dc = denom2inv * (-a * a * dL_dconic.z + 2 * a * b * dL_dconic.y + (denom - a * c) * dL_dconic.x);
+		dL_db = denom2inv * 2 * (b * c * dL_dconic.x - (denom + 2 * b * b) * dL_dconic.y + a * b * dL_dconic.z);
 
-		// ∂L/∂c = ∂L/∂C · ∂C/∂c + ∂L/∂B · ∂B/∂c + ∂L/∂A · ∂A/∂c
-		dL_dc = denom2inv * (
-			-a*a * dL_dconic.z
-		+ 2*a*b * dL_dconic.y
-		+ (denom - a*c) * dL_dconic.x
-		);
+		// Gradients of loss L w.r.t. each 3D covariance matrix (Vrk) entry, 
+		// given gradients w.r.t. 2D covariance matrix (diagonal).
+		// cov2D = transpose(T) * transpose(Vrk) * T;
+		dL_dcov[6 * idx + 0] = (T[0][0] * T[0][0] * dL_da + T[0][0] * T[1][0] * dL_db + T[1][0] * T[1][0] * dL_dc);
+		dL_dcov[6 * idx + 3] = (T[0][1] * T[0][1] * dL_da + T[0][1] * T[1][1] * dL_db + T[1][1] * T[1][1] * dL_dc);
+		dL_dcov[6 * idx + 5] = (T[0][2] * T[0][2] * dL_da + T[0][2] * T[1][2] * dL_db + T[1][2] * T[1][2] * dL_dc);
 
-		// ∂L/∂b = ∂L/∂B · ∂B/∂b + ∂L/∂A · ∂A/∂b + ∂L/∂C · ∂C/∂b
-		dL_db = denom2inv * 2 * (
-			b*c * dL_dconic.x
-		- (denom + 2*b*b) * dL_dconic.y
-		+ a*b * dL_dconic.z
-		);
-
-		// 7) 分摊到每个 y_i，再链到 x_i → μ_c, L
-		glm::vec3 dL_dμc_loc(0.f);
-		float dL_dL_loc[9] = {0};
-		const float factor = 2.f * invN;
-		#pragma unroll
-		for (int s = 0; s < N_SAMPLES; ++s)
-		{
-			glm::vec3 z = STANDARD_NORMAL_SAMPLES[s];
-			glm::vec3 x = mu_c + lowerTriMul(L, z);
-			float u,v; glm::mat2x3 J;
-			projectPerspMasked(x, h_x, h_y, limx, limy, u, v, J);
-	
-			float du = u - u_bar, dv = v - v_bar;
-			float gu = factor * (dL_da*du + dL_db*dv);
-			float gv = factor * (dL_db*du + dL_dc*dv);
-	
-			glm::vec3 grad_x = glm::vec3(
-				J[0][0]*gu + J[1][0]*gv,
-				J[0][1]*gu + J[1][1]*gv,
-				J[0][2]*gu + J[1][2]*gv
-			);
-			dL_dμc_loc += grad_x;
-			// 下三角累加
-			dL_dL_loc[0] += grad_x.x * z.x;
-			dL_dL_loc[3] += grad_x.y * z.x;
-			dL_dL_loc[4] += grad_x.y * z.y;
-			dL_dL_loc[6] += grad_x.z * z.x;
-			dL_dL_loc[7] += grad_x.z * z.y;
-			dL_dL_loc[8] += grad_x.z * z.z;
-		}
-	
-		// 8) L→Σ_c→Σ_w，同原 math_support.pdf 2.4+2.5
-		glm::mat3 dL_dL_mat(
-		  dL_dL_loc[0], 0, 0,
-		  dL_dL_loc[3], dL_dL_loc[4], 0,
-		  dL_dL_loc[6], dL_dL_loc[7], dL_dL_loc[8]
-		);
-		glm::mat3 L_invT = glm::transpose(glm::inverse(L));
-		glm::mat3 M       = L_invT * dL_dL_mat;
-		glm::mat3 dΣc     = 0.5f*(M + glm::transpose(M));
-		glm::mat3 dΣw     = glm::transpose(W) * dΣc * W;
-	
-		// 存回 Σ_w 梯度（6 元素）
-		dL_dcov[6*idx + 0] = dΣw[0][0];
-		dL_dcov[6*idx + 1] = dΣw[0][1]*2.f;
-		dL_dcov[6*idx + 2] = dΣw[0][2]*2.f;
-		dL_dcov[6*idx + 3] = dΣw[1][1];
-		dL_dcov[6*idx + 4] = dΣw[1][2]*2.f;
-		dL_dcov[6*idx + 5] = dΣw[2][2];
-	
-		// 9) μ_c→μ_w
-		dL_dmeans[idx] += glm::transpose(W) * dL_dμc_loc;
+		// Gradients of loss L w.r.t. each 3D covariance matrix (Vrk) entry, 
+		// given gradients w.r.t. 2D covariance matrix (off-diagonal).
+		// Off-diagonal elements appear twice --> double the gradient.
+		// cov2D = transpose(T) * transpose(Vrk) * T;
+		dL_dcov[6 * idx + 1] = 2 * T[0][0] * T[0][1] * dL_da + (T[0][0] * T[1][1] + T[0][1] * T[1][0]) * dL_db + 2 * T[1][0] * T[1][1] * dL_dc;
+		dL_dcov[6 * idx + 2] = 2 * T[0][0] * T[0][2] * dL_da + (T[0][0] * T[1][2] + T[0][2] * T[1][0]) * dL_db + 2 * T[1][0] * T[1][2] * dL_dc;
+		dL_dcov[6 * idx + 4] = 2 * T[0][2] * T[0][1] * dL_da + (T[0][1] * T[1][2] + T[0][2] * T[1][1]) * dL_db + 2 * T[1][1] * T[1][2] * dL_dc;
 	}
 	else
 	{
 		for (int i = 0; i < 6; i++)
 			dL_dcov[6 * idx + i] = 0;
 	}
+
+	// Gradients of loss w.r.t. upper 2x3 portion of intermediate matrix T
+	// cov2D = transpose(T) * transpose(Vrk) * T;
+	float dL_dT00 = 2 * (T[0][0] * Vrk[0][0] + T[0][1] * Vrk[0][1] + T[0][2] * Vrk[0][2]) * dL_da +
+		(T[1][0] * Vrk[0][0] + T[1][1] * Vrk[0][1] + T[1][2] * Vrk[0][2]) * dL_db;
+	float dL_dT01 = 2 * (T[0][0] * Vrk[1][0] + T[0][1] * Vrk[1][1] + T[0][2] * Vrk[1][2]) * dL_da +
+		(T[1][0] * Vrk[1][0] + T[1][1] * Vrk[1][1] + T[1][2] * Vrk[1][2]) * dL_db;
+	float dL_dT02 = 2 * (T[0][0] * Vrk[2][0] + T[0][1] * Vrk[2][1] + T[0][2] * Vrk[2][2]) * dL_da +
+		(T[1][0] * Vrk[2][0] + T[1][1] * Vrk[2][1] + T[1][2] * Vrk[2][2]) * dL_db;
+	float dL_dT10 = 2 * (T[1][0] * Vrk[0][0] + T[1][1] * Vrk[0][1] + T[1][2] * Vrk[0][2]) * dL_dc +
+		(T[0][0] * Vrk[0][0] + T[0][1] * Vrk[0][1] + T[0][2] * Vrk[0][2]) * dL_db;
+	float dL_dT11 = 2 * (T[1][0] * Vrk[1][0] + T[1][1] * Vrk[1][1] + T[1][2] * Vrk[1][2]) * dL_dc +
+		(T[0][0] * Vrk[1][0] + T[0][1] * Vrk[1][1] + T[0][2] * Vrk[1][2]) * dL_db;
+	float dL_dT12 = 2 * (T[1][0] * Vrk[2][0] + T[1][1] * Vrk[2][1] + T[1][2] * Vrk[2][2]) * dL_dc +
+		(T[0][0] * Vrk[2][0] + T[0][1] * Vrk[2][1] + T[0][2] * Vrk[2][2]) * dL_db;
+
+	// Gradients of loss w.r.t. upper 3x2 non-zero entries of Jacobian matrix
+	// T = W * J
+	float dL_dJ00 = W[0][0] * dL_dT00 + W[0][1] * dL_dT01 + W[0][2] * dL_dT02;
+	float dL_dJ02 = W[2][0] * dL_dT00 + W[2][1] * dL_dT01 + W[2][2] * dL_dT02;
+	float dL_dJ11 = W[1][0] * dL_dT10 + W[1][1] * dL_dT11 + W[1][2] * dL_dT12;
+	float dL_dJ12 = W[2][0] * dL_dT10 + W[2][1] * dL_dT11 + W[2][2] * dL_dT12;
+
+	float tz = 1.f / t.z;
+	float tz2 = tz * tz;
+	float tz3 = tz2 * tz;
+
+	// Gradients of loss w.r.t. transformed Gaussian mean t
+	float dL_dtx = x_grad_mul * -h_x * tz2 * dL_dJ02;
+	float dL_dty = y_grad_mul * -h_y * tz2 * dL_dJ12;
+	float dL_dtz = -h_x * tz2 * dL_dJ00 - h_y * tz2 * dL_dJ11 + (2 * h_x * t.x) * tz3 * dL_dJ02 + (2 * h_y * t.y) * tz3 * dL_dJ12;
+
+	// Account for transformation of mean to t
+	// t = transformPoint4x3(mean, view_matrix);
+	float3 dL_dmean = transformVec4x3Transpose({ dL_dtx, dL_dty, dL_dtz }, view_matrix);
+
+	// Gradients of loss w.r.t. Gaussian means, but only the portion 
+	// that is caused because the mean affects the covariance matrix.
+	// Additional mean gradient is accumulated in BACKWARD::preprocess.
+	dL_dmeans[idx] = dL_dmean;
 }
 
 // Backward pass for the conversion of scale and rotation to a 
@@ -487,7 +375,6 @@ __global__ void preprocessCUDA(
 
 	// Compute loss gradient w.r.t. 3D means due to gradients of 2D means
 	// from rendering procedure
-	// ⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️
 	glm::vec3 dL_dmean;
 	float mul1 = (proj[0] * m.x + proj[4] * m.y + proj[8] * m.z + proj[12]) * m_w * m_w;
 	float mul2 = (proj[1] * m.x + proj[5] * m.y + proj[9] * m.z + proj[13]) * m_w * m_w;
