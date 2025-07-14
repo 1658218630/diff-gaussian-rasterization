@@ -189,40 +189,54 @@
      CUDA_CHECK(cudaMemcpy(g_cov,   d_dLdCov,   sizeof(g_cov),  cudaMemcpyDeviceToHost));
  
      //=============== 5. Finite difference: central difference & error criterion ===============
-     const float eps  = 1e-4f;
+     const float eps  = 5e-3f;
      const float rtol = 1e-3f;
      const float atol = 1e-5f;
  
      auto compute_fd = [&](auto setter)->float {
-         // +eps
-         setter(+eps);
-         CUDA_CHECK(cudaMemcpy(d_means,  h_means,  sizeof(h_means),  cudaMemcpyHostToDevice));
-         CUDA_CHECK(cudaMemcpy(d_cov3Ds, h_cov3Ds, sizeof(h_cov3Ds), cudaMemcpyHostToDevice));
-         ForwardKernel<<<1,1>>>(P, d_means, d_cov3Ds, fx, fy, tan_fx, tan_fy, d_view, d_conic_eps);
-         CUDA_CHECK(cudaDeviceSynchronize());
-         float4 pos; CUDA_CHECK(cudaMemcpy(&pos, d_conic_eps, sizeof(pos), cudaMemcpyDeviceToHost));
- 
-         // -eps
-         setter(-eps);
-         CUDA_CHECK(cudaMemcpy(d_means,  h_means,  sizeof(h_means),  cudaMemcpyHostToDevice));
-         CUDA_CHECK(cudaMemcpy(d_cov3Ds, h_cov3Ds, sizeof(h_cov3Ds), cudaMemcpyHostToDevice));
-         ForwardKernel<<<1,1>>>(P, d_means, d_cov3Ds, fx, fy, tan_fx, tan_fy, d_view, d_conic_eps);
-         CUDA_CHECK(cudaDeviceSynchronize());
-         float4 neg; CUDA_CHECK(cudaMemcpy(&neg, d_conic_eps, sizeof(neg), cudaMemcpyDeviceToHost));
- 
-         setter(0.f);  // restore
-        //  float Lpos = pos.x*h_dLdConic[0] + pos.y*h_dLdConic[1] + pos.w*h_dLdConic[3];
-        //  float Lneg = neg.x*h_dLdConic[0] + neg.y*h_dLdConic[1] + neg.w*h_dLdConic[3];
-         float Lpos = pos.x*h_dLdConic[0] + pos.y*h_dLdConic[1] + pos.z*h_dLdConic[3];
-         float Lneg = neg.x*h_dLdConic[0] + neg.y*h_dLdConic[1] + neg.z*h_dLdConic[3];
-         return (Lpos - Lneg) / (2.f * eps);
-     };
+        // 1. save original value
+        float3  mean_backup = h_means[0];
+        float   cov_backup  = h_cov3Ds[5];
+    
+        // 2. +eps
+        setter(+eps);                                   // baseline + ε
+        CUDA_CHECK(cudaMemcpy(d_means,  h_means, sizeof(h_means),  cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_cov3Ds, h_cov3Ds,sizeof(h_cov3Ds), cudaMemcpyHostToDevice));
+        ForwardKernel<<<1,1>>>(P, d_means, d_cov3Ds, fx, fy, tan_fx, tan_fy, d_view, d_conic_eps);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        float4 pos; CUDA_CHECK(cudaMemcpy(&pos, d_conic_eps, sizeof(pos), cudaMemcpyDeviceToHost));
+        float Lpos = pos.x*h_dLdConic[0] + pos.y*h_dLdConic[1] + pos.z*h_dLdConic[3];
+        
+    
+        // 3. restore original value
+        h_means[0]  = mean_backup;
+        h_cov3Ds[5] = cov_backup;
+    
+        // 4. -eps
+        setter(-eps);                                   // baseline − ε
+        CUDA_CHECK(cudaMemcpy(d_means,  h_means, sizeof(h_means),  cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_cov3Ds, h_cov3Ds,sizeof(h_cov3Ds), cudaMemcpyHostToDevice));
+        ForwardKernel<<<1,1>>>(P, d_means, d_cov3Ds, fx, fy, tan_fx, tan_fy, d_view, d_conic_eps);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        float4 neg; CUDA_CHECK(cudaMemcpy(&neg, d_conic_eps, sizeof(neg), cudaMemcpyDeviceToHost));
+        float Lneg = neg.x*h_dLdConic[0] + neg.y*h_dLdConic[1] + neg.z*h_dLdConic[3];
+    
+        // 5. restore original value for next call
+        h_means[0]  = mean_backup;
+        h_cov3Ds[5] = cov_backup;
+    
+        //return (Lpos - Lneg) / (2.f * eps);
+        return float((Lpos - Lneg) / (2.0 * eps));
+    };
+    
+
  
      float g_fd_mu[3];
      g_fd_mu[0] = compute_fd([&](float d){ h_means[0].x += d; });
      g_fd_mu[1] = compute_fd([&](float d){ h_means[0].y += d; });
      g_fd_mu[2] = compute_fd([&](float d){ h_means[0].z += d; });
      float g_fd_covzz = compute_fd([&](float d){ h_cov3Ds[5] += d; });
+
  
      //=============== 6. Print & determine ===============
      printf("\nAnalytic   dL/dμ = (% .6f % .6f % .6f)\n", g_mean.x, g_mean.y, g_mean.z);
