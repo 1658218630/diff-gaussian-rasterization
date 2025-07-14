@@ -229,7 +229,8 @@ __global__ void computeCov2DCUDA(int P,
 	const float* view_matrix,
 	const float* dL_dconics,
 	float3* dL_dmeans,
-	float* dL_dcov)
+	float* dL_dcov,
+	const bool use_proj_mean)
 {
 	auto idx = cg::this_grid().thread_rank();
 	if (idx >= P || !(radii[idx] > 0))
@@ -256,175 +257,240 @@ __global__ void computeCov2DCUDA(int P,
     );
 	glm::mat3 Σc = W * Σw * glm::transpose(W);  // Σ_c
 
-	//--------------------------------------------------
-    // 2) Cholesky Σ_c = L Lᵀ
-    //--------------------------------------------------
-    glm::mat3 L;
-    cholesky3x3(Σc, L);
 
-	//--------------------------------------------------
-    // 3) moment matching (mean + covariance)
-    //--------------------------------------------------
-	// Precompute constants
-	const int N_SAMPLES = NUM_STD_SAMPLES; // number of samples (statistical_constants.cuh)
+	if (use_proj_mean) {
+		// **解析路径（使用投影中心均值）**
 
-    const float limx = 1.3f * tan_fovx;
-    const float limy = 1.3f * tan_fovy;
-    const float invN = 1.f / float(N_SAMPLES);
+        // 1) 计算摄像机空间均值的透视投影，并进行裁剪。
+        const float limx = 1.3f * tan_fovx;
+        const float limy = 1.3f * tan_fovy;
+        float u_center, v_center;
+        glm::mat2x3 J_center;
+        projectPerspMasked(to_glm(mu_cam), h_x, h_y, limx, limy, u_center, v_center, J_center);
+        // – J_center 是 (u,v) 对 (x_c,y_c,z_c) 的 2×3 雅可比矩阵，包含焦距缩放和裁剪屏蔽（xm, ym）。
 
-	float sum_u = 0.f, sum_v = 0.f;
-	float sum_uu = 0.f, sum_uv = 0.f, sum_vv = 0.f;
+        // 2) 将两个雅可比行转换成 3D 向量（便于点积）。
+        glm::vec3 j0 = glm::vec3(J_center[0][0], J_center[0][1], J_center[0][2]);  // 雅可比的第一行（对应 u）
+        glm::vec3 j1 = glm::vec3(J_center[1][0], J_center[1][1], J_center[1][2]);  // 雅可比的第二行（对应 v）
 
-	#pragma unroll
-	for (int s = 0; s < N_SAMPLES; ++s) {
-		// 1) xi = mu_cam + L z_i
-		// glm::vec3 x = mu_cam + lowerTriMul(L, BASE_SAMPLES_MAX[s]);
-		int baseIdx = 3 * s;  
-		glm::vec3 sample(
-			BASE_SAMPLES_MAX[baseIdx+0],
-			BASE_SAMPLES_MAX[baseIdx+1],
-			BASE_SAMPLES_MAX[baseIdx+2]
-		);
+        // 3) 计算 2D 协方差矩(a, b, c)（对角线上加 0.3 以保持稳定性）。
+        glm::vec3 Σc_j0 = Σc * j0;
+        glm::vec3 Σc_j1 = Σc * j1;
+        float a = glm::dot(j0, Σc_j0) + 0.3f;        // σ_x^2 + ε
+        float b = glm::dot(j0, Σc_j1);              // cov_xy
+        float c = glm::dot(j1, Σc_j1) + 0.3f;        // σ_y^2 + ε
 
-		// If lowerTriMul is modified to accept glm::vec3 and return glm::vec3
-		glm::vec3 delta = lowerTriMul(L, sample);  
-		// glm::vec3 x     = mu_cam + delta;
-		glm::vec3 x = to_glm(mu_cam) + delta;
+        // 4) 计算共轭锥体参数的逆，并使用链式法则求梯度。
+        float det    = a * c - b * b;
+        float denom2 = (det * det) + 1e-7f;         // 加小量防止除零
+        float denom2inv = 1.0f / denom2;
+        // 获取损失相对于共轭锥体参数 (A, B, C) 的梯度。【注意】此处使用索引 0、1、2 分别对应 A、B、C。
+        float dL_dA = dL_dconics[4 * idx + 0];
+        float dL_dB = dL_dconics[4 * idx + 1];
+        float dL_dC = dL_dconics[4 * idx + 2];
+        // 使用链式法则计算 ∂L/∂a, ∂L/∂b, ∂L/∂c（与前向 A=c/det, B=-b/det, C=a/det 相对应）。
+        float dL_da = denom2inv * ( -c * c * dL_dA 
+                                    + b * c * dL_dB 
+                                    + (det - a * c) * dL_dC );
+        float dL_db = denom2inv * 2.0f * ( b * c * dL_dA 
+                                           - b * b * dL_dB 
+                                           + a * b * dL_dC );
+        float dL_dc = denom2inv * ( -a * a * dL_dC 
+                                    + a * b * dL_dB 
+                                    + (det - a * c) * dL_dA );
 
+        // 5) 反向传播到 Σ_c：构造对称梯度矩阵 dΣc。
+        //    ∂L/∂Σc = dL_da * (j0⊗j0) + dL_db * ((j0⊗j1 + j1⊗j0)/2) + dL_dc * (j1⊗j1)。
+        //    “⊗” 表示外积。对 cov_xy 项使用 (A + A^T)/2 以保证对称性。
+        glm::mat3 term_aa = glm::outerProduct(j0, j0);                             // j0 * j0^T
+        glm::mat3 term_cc = glm::outerProduct(j1, j1);                             // j1 * j1^T
+        glm::mat3 term_bb = 0.5f * (glm::outerProduct(j0, j1) + glm::outerProduct(j1, j0));  // 对称化的 j0 * j1^T
+        glm::mat3 dΣc = dL_da * term_aa + dL_db * term_bb + dL_dc * term_cc;
+        // 6) 通过链式法则将 ∂L/∂Σ_c 转换为 ∂L/∂Σ_w（世界空间协方差）：Σ_c = W * Σ_w * W^T。
+        glm::mat3 dΣw = glm::transpose(W) * dΣc * W;
+        // 7) 以 6 元素上三角格式存储 ∂L/∂Σ_w。（对角元素原样，非对角元素乘 2，因为上三角中只存一次）
+        dL_dcov[6 * idx + 0] = dΣw[0][0];
+        dL_dcov[6 * idx + 1] = 2.0f * dΣw[0][1];
+        dL_dcov[6 * idx + 2] = 2.0f * dΣw[0][2];
+        dL_dcov[6 * idx + 3] = dΣw[1][1];
+        dL_dcov[6 * idx + 4] = 2.0f * dΣw[1][2];
+        dL_dcov[6 * idx + 5] = dΣw[2][2];
 
-		// 2) yi = p(xi) and mask & clamp
-		float u, v; glm::mat2x3 J;
-		projectPerspMasked(x, h_x, h_y, limx, limy, u, v, J);
+        // 8) 在投影中心路径中，不在此累加 dL_dmeans。
+        // 剩余的均值梯度（由投影中心位置变化引起）将在 BACKWARD::preprocess 中处理。
+        // 留下 dL_dmeans[idx] 为 0，避免重复累加。
+    }
+	else {
+		//--------------------------------------------------
+		// 2) Cholesky Σ_c = L Lᵀ
+		//--------------------------------------------------
+		glm::mat3 L;
+		cholesky3x3(Σc, L);
 
-		// 3) Accumulate first and second order moments
-		sum_u  += u;
-		sum_v  += v;
-		sum_uu += u * u;
-		sum_uv += u * v;
-		sum_vv += v * v;
-	}
+		//--------------------------------------------------
+		// 3) moment matching (mean + covariance)
+		//--------------------------------------------------
+		// Precompute constants
+		const int N_SAMPLES = NUM_STD_SAMPLES; // number of samples (statistical_constants.cuh)
 
-	//--------------------------------------------------
-	// 4) Calculate μ2d and Σ2d from accumulated matrix quantities: mean2d = (u_bar, v_bar), cov2d = (a, b, c)
-	//--------------------------------------------------
-	// const float invN = 1.f / float(N_SAMPLES);
-	float u_bar = sum_u * invN;            // E[u]
-	float v_bar = sum_v * invN;            // E[v]
+		const float limx = 1.3f * tan_fovx;
+		const float limy = 1.3f * tan_fovy;
+		const float invN = 1.f / float(N_SAMPLES);
 
-	// E[u²], E[uv], E[v²]
-	float eu2 = sum_uu * invN;
-	float euv = sum_uv * invN;
-	float ev2 = sum_vv * invN;
+		float sum_u = 0.f, sum_v = 0.f;
+		float sum_uu = 0.f, sum_uv = 0.f, sum_vv = 0.f;
 
-	// variance and covariance
-	float a = eu2 - u_bar * u_bar + 0.3f;   // σ_x² + ε
-	float b = euv - u_bar * v_bar;          // cov_xy
-	float c = ev2 - v_bar * v_bar + 0.3f;   // σ_y² + ε
-
-	//--------------------------------------------------
-	// 5) conic→(a,b,c)  backward
-	//--------------------------------------------------
-	float denom = a * c - b * b;
-	float dL_da = 0, dL_db = 0, dL_dc = 0;
-	float denom2inv = 1.0f / ((denom * denom) + 0.0000001f);
-
-	// Extract loss gradient from conic
-	float3 dL_dconic = { dL_dconics[4*idx],
-						dL_dconics[4*idx+1],
-						dL_dconics[4*idx+3] }; 
-
-	if (denom2inv != 0)
-	{
-		// ∂L/∂a = ∂L/∂A · ∂A/∂a + ∂L/∂B · ∂B/∂a + ∂L/∂C · ∂C/∂a
-		dL_da = denom2inv * (
-			-c*c * dL_dconic.x     // ∂A/∂a = -c² / denom²
-		+ b*c * dL_dconic.y   // ∂B/∂a =  bc / denom²
-		+ (denom - a*c) * dL_dconic.z  // ∂C/∂a = (denom - ac)/denom²
-		);
-
-		// ∂L/∂c = ∂L/∂C · ∂C/∂c + ∂L/∂B · ∂B/∂c + ∂L/∂A · ∂A/∂c
-		dL_dc = denom2inv * (
-			-a*a * dL_dconic.z
-		+ a*b * dL_dconic.y  // ∂B/∂c = a*b / det^2
-		+ (denom - a*c) * dL_dconic.x
-		);
-
-		// ∂L/∂b = ∂L/∂B · ∂B/∂b + ∂L/∂A · ∂A/∂b + ∂L/∂C · ∂C/∂b
-		dL_db = denom2inv * 2 * (
-			b*c * dL_dconic.x
-		- (denom + 2*b*b) * dL_dconic.y
-		+ a*b * dL_dconic.z
-		);
-
-		// 7) Apportioned to each y_i, then chain to x_i → μ_c, L
-		glm::vec3 dL_dμc_loc(0.f);
-		float dL_dL_loc[9] = {0};
-		const float factor = 2.f * invN;
 		#pragma unroll
-		for (int s = 0; s < N_SAMPLES; ++s)
-		{
-			float s0 = BASE_SAMPLES_MAX[3*s + 0];
-			float s1 = BASE_SAMPLES_MAX[3*s + 1];
-			float s2 = BASE_SAMPLES_MAX[3*s + 2];
-			glm::vec3 z(s0, s1, s2);
-
-			// glm::vec3 x = mu_cam + lowerTriMul(L, z);
-			glm::vec3 x = to_glm(mu_cam) + lowerTriMul(L, z);
-			float u,v; glm::mat2x3 J;
-			projectPerspMasked(x, h_x, h_y, limx, limy, u, v, J);
-	
-			float du = u - u_bar, dv = v - v_bar;
-			float gu = factor * (dL_da*du + dL_db*dv);
-			float gv = factor * (dL_db*du + dL_dc*dv);
-	
-			glm::vec3 grad_x = glm::vec3(
-				J[0][0]*gu + J[1][0]*gv,
-				J[0][1]*gu + J[1][1]*gv,
-				J[0][2]*gu + J[1][2]*gv
+		for (int s = 0; s < N_SAMPLES; ++s) {
+			// 1) xi = mu_cam + L z_i
+			// glm::vec3 x = mu_cam + lowerTriMul(L, BASE_SAMPLES_MAX[s]);
+			int baseIdx = 3 * s;  
+			glm::vec3 sample(
+				BASE_SAMPLES_MAX[baseIdx+0],
+				BASE_SAMPLES_MAX[baseIdx+1],
+				BASE_SAMPLES_MAX[baseIdx+2]
 			);
-			dL_dμc_loc += grad_x;
-			// lower triangular accumulate
-			dL_dL_loc[0] += grad_x.x * z.x;
-			dL_dL_loc[3] += grad_x.y * z.x;
-			dL_dL_loc[4] += grad_x.y * z.y;
-			dL_dL_loc[6] += grad_x.z * z.x;
-			dL_dL_loc[7] += grad_x.z * z.y;
-			dL_dL_loc[8] += grad_x.z * z.z;
+
+			// If lowerTriMul is modified to accept glm::vec3 and return glm::vec3
+			glm::vec3 delta = lowerTriMul(L, sample);  
+			// glm::vec3 x     = mu_cam + delta;
+			glm::vec3 x = to_glm(mu_cam) + delta;
+
+
+			// 2) yi = p(xi) and mask & clamp
+			float u, v; glm::mat2x3 J;
+			projectPerspMasked(x, h_x, h_y, limx, limy, u, v, J);
+
+			// 3) Accumulate first and second order moments
+			sum_u  += u;
+			sum_v  += v;
+			sum_uu += u * u;
+			sum_uv += u * v;
+			sum_vv += v * v;
 		}
-	
-		// 8) L→Σ_c→Σ_w, same as original math_support.pdf 2.4+2.5
-		glm::mat3 dL_dL_mat(
-		  dL_dL_loc[0], 0, 0,
-		  dL_dL_loc[3], dL_dL_loc[4], 0,
-		  dL_dL_loc[6], dL_dL_loc[7], dL_dL_loc[8]
-		);
-		glm::mat3 L_invT = glm::transpose(glm::inverse(L));
-		glm::mat3 M       = L_invT * dL_dL_mat;
-		glm::mat3 dΣc     = 0.5f*(M + glm::transpose(M));
-		glm::mat3 dΣw     = glm::transpose(W) * dΣc * W;
-	
-		// store Σ_w gradient (6 elements)
-		dL_dcov[6*idx + 0] = dΣw[0][0];
-		dL_dcov[6*idx + 1] = dΣw[0][1]*2.f;
-		dL_dcov[6*idx + 2] = dΣw[0][2]*2.f;
-		dL_dcov[6*idx + 3] = dΣw[1][1];
-		dL_dcov[6*idx + 4] = dΣw[1][2]*2.f;
-		dL_dcov[6*idx + 5] = dΣw[2][2];
-	
-		// 9) μ_c→μ_w
-		// dL_dmeans[idx] += glm::transpose(W) * dL_dμc_loc;
-		// dL_dmeans[idx] += to_float3(glm::transpose(W) * dL_dμc_loc);
-		float3 inc = to_float3(glm::transpose(W) * dL_dμc_loc);
-		dL_dmeans[idx].x += inc.x;
-		dL_dmeans[idx].y += inc.y;
-		dL_dmeans[idx].z += inc.z;
+
+		//--------------------------------------------------
+		// 4) Calculate μ2d and Σ2d from accumulated matrix quantities: mean2d = (u_bar, v_bar), cov2d = (a, b, c)
+		//--------------------------------------------------
+		// const float invN = 1.f / float(N_SAMPLES);
+		float u_bar = sum_u * invN;            // E[u]
+		float v_bar = sum_v * invN;            // E[v]
+
+		// E[u²], E[uv], E[v²]
+		float eu2 = sum_uu * invN;
+		float euv = sum_uv * invN;
+		float ev2 = sum_vv * invN;
+
+		// variance and covariance
+		float a = eu2 - u_bar * u_bar + 0.3f;   // σ_x² + ε
+		float b = euv - u_bar * v_bar;          // cov_xy
+		float c = ev2 - v_bar * v_bar + 0.3f;   // σ_y² + ε
+
+		//--------------------------------------------------
+		// 5) conic→(a,b,c)  backward
+		//--------------------------------------------------
+		float denom = a * c - b * b;
+		float dL_da = 0, dL_db = 0, dL_dc = 0;
+		float denom2inv = 1.0f / ((denom * denom) + 0.0000001f);
+
+		// Extract loss gradient from conic
+		float3 dL_dconic = { dL_dconics[4*idx],
+							dL_dconics[4*idx+1],
+							dL_dconics[4*idx+3] }; 
+
+		if (denom2inv != 0)
+		{
+			// ∂L/∂a = ∂L/∂A · ∂A/∂a + ∂L/∂B · ∂B/∂a + ∂L/∂C · ∂C/∂a
+			dL_da = denom2inv * (
+				-c*c * dL_dconic.x     // ∂A/∂a = -c² / denom²
+			+ b*c * dL_dconic.y   // ∂B/∂a =  bc / denom²
+			+ (denom - a*c) * dL_dconic.z  // ∂C/∂a = (denom - ac)/denom²
+			);
+
+			// ∂L/∂c = ∂L/∂C · ∂C/∂c + ∂L/∂B · ∂B/∂c + ∂L/∂A · ∂A/∂c
+			dL_dc = denom2inv * (
+				-a*a * dL_dconic.z
+			+ a*b * dL_dconic.y  // ∂B/∂c = a*b / det^2
+			+ (denom - a*c) * dL_dconic.x
+			);
+
+			// ∂L/∂b = ∂L/∂B · ∂B/∂b + ∂L/∂A · ∂A/∂b + ∂L/∂C · ∂C/∂b
+			dL_db = denom2inv * 2 * (
+				b*c * dL_dconic.x
+			- (denom + 2*b*b) * dL_dconic.y
+			+ a*b * dL_dconic.z
+			);
+
+			// 7) Apportioned to each y_i, then chain to x_i → μ_c, L
+			glm::vec3 dL_dμc_loc(0.f);
+			float dL_dL_loc[9] = {0};
+			const float factor = 2.f * invN;
+			#pragma unroll
+			for (int s = 0; s < N_SAMPLES; ++s)
+			{
+				float s0 = BASE_SAMPLES_MAX[3*s + 0];
+				float s1 = BASE_SAMPLES_MAX[3*s + 1];
+				float s2 = BASE_SAMPLES_MAX[3*s + 2];
+				glm::vec3 z(s0, s1, s2);
+
+				// glm::vec3 x = mu_cam + lowerTriMul(L, z);
+				glm::vec3 x = to_glm(mu_cam) + lowerTriMul(L, z);
+				float u,v; glm::mat2x3 J;
+				projectPerspMasked(x, h_x, h_y, limx, limy, u, v, J);
+		
+				float du = u - u_bar, dv = v - v_bar;
+				float gu = factor * (dL_da*du + dL_db*dv);
+				float gv = factor * (dL_db*du + dL_dc*dv);
+		
+				glm::vec3 grad_x = glm::vec3(
+					J[0][0]*gu + J[1][0]*gv,
+					J[0][1]*gu + J[1][1]*gv,
+					J[0][2]*gu + J[1][2]*gv
+				);
+				dL_dμc_loc += grad_x;
+				// lower triangular accumulate
+				dL_dL_loc[0] += grad_x.x * z.x;
+				dL_dL_loc[3] += grad_x.y * z.x;
+				dL_dL_loc[4] += grad_x.y * z.y;
+				dL_dL_loc[6] += grad_x.z * z.x;
+				dL_dL_loc[7] += grad_x.z * z.y;
+				dL_dL_loc[8] += grad_x.z * z.z;
+			}
+		
+			// 8) L→Σ_c→Σ_w, same as original math_support.pdf 2.4+2.5
+			glm::mat3 dL_dL_mat(
+			dL_dL_loc[0], 0, 0,
+			dL_dL_loc[3], dL_dL_loc[4], 0,
+			dL_dL_loc[6], dL_dL_loc[7], dL_dL_loc[8]
+			);
+			glm::mat3 L_invT = glm::transpose(glm::inverse(L));
+			glm::mat3 M       = L_invT * dL_dL_mat;
+			glm::mat3 dΣc     = 0.5f*(M + glm::transpose(M));
+			glm::mat3 dΣw     = glm::transpose(W) * dΣc * W;
+		
+			// store Σ_w gradient (6 elements)
+			dL_dcov[6*idx + 0] = dΣw[0][0];
+			dL_dcov[6*idx + 1] = dΣw[0][1]*2.f;
+			dL_dcov[6*idx + 2] = dΣw[0][2]*2.f;
+			dL_dcov[6*idx + 3] = dΣw[1][1];
+			dL_dcov[6*idx + 4] = dΣw[1][2]*2.f;
+			dL_dcov[6*idx + 5] = dΣw[2][2];
+		
+			// 9) μ_c→μ_w
+			// dL_dmeans[idx] += glm::transpose(W) * dL_dμc_loc;
+			// dL_dmeans[idx] += to_float3(glm::transpose(W) * dL_dμc_loc);
+			float3 inc = to_float3(glm::transpose(W) * dL_dμc_loc);
+			dL_dmeans[idx].x += inc.x;
+			dL_dmeans[idx].y += inc.y;
+			dL_dmeans[idx].z += inc.z;
 
 
-	}
-	else
-	{
-		for (int i = 0; i < 6; i++)
-			dL_dcov[6 * idx + i] = 0;
+		}
+		else
+		{
+			for (int i = 0; i < 6; i++)
+				dL_dcov[6 * idx + i] = 0;
+		}
 	}
 }
 
@@ -734,7 +800,8 @@ void BACKWARD::preprocess(
 	float* dL_dcov3D,
 	float* dL_dsh,
 	glm::vec3* dL_dscale,
-	glm::vec4* dL_drot)
+	glm::vec4* dL_drot,
+	const bool use_proj_mean)
 {
 	// Propagate gradients for the path of 2D conic matrix computation. 
 	// Somewhat long, thus it is its own kernel rather than being part of 
@@ -752,7 +819,8 @@ void BACKWARD::preprocess(
 		viewmatrix,
 		dL_dconic,
 		(float3*)dL_dmean3D,
-		dL_dcov3D);
+		dL_dcov3D,
+		use_proj_mean);
 
 	// Propagate gradients for remaining steps: finish 3D mean gradients,
 	// propagate color gradients to SH (if desireD), propagate 3D covariance
@@ -774,7 +842,8 @@ void BACKWARD::preprocess(
 		dL_dcov3D,
 		dL_dsh,
 		dL_dscale,
-		dL_drot);
+		dL_drot,
+		use_proj_mean);
 }
 
 void BACKWARD::render(
@@ -792,7 +861,8 @@ void BACKWARD::render(
 	float3* dL_dmean2D,
 	float4* dL_dconic2D,
 	float* dL_dopacity,
-	float* dL_dcolors)
+	float* dL_dcolors,
+	const bool use_proj_mean)
 {
 	renderCUDA<NUM_CHANNELS> << <grid, block >> >(
 		ranges,
