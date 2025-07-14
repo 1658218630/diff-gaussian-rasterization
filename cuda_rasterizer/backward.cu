@@ -331,8 +331,7 @@ __global__ void computeCov2DCUDA(int P,
 	// Extract loss gradient from conic
 	float3 dL_dconic = { dL_dconics[4*idx],
 						dL_dconics[4*idx+1],
-						dL_dconics[4*idx+2] }; 
-						// dL_dconics[4*idx+3] }; 
+						dL_dconics[4*idx+3] }; 
 
 	if (denom2inv != 0)
 	{
