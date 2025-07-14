@@ -13,6 +13,15 @@
 #include "auxiliary.h"
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
+
+
+#include <glm/glm.hpp>
+#include <cuda_runtime.h>
+
+// ⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️
+#include "statistical_constants.cuh"
+// ⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️
+
 namespace cg = cooperative_groups;
 
 // Backward pass for conversion of spherical harmonics to RGB for
@@ -197,6 +206,16 @@ J[0][0] =  h_x * invZ   * xm;  J[0][1] = 0.f;               J[0][2] = -h_x * x.x
 J[1][0] = 0.f;                 J[1][1] =  h_y * invZ   * ym; J[1][2] = -h_y * x.y * invZ2 * ym;
 }
 
+__host__ __device__ 
+inline glm::vec3 to_glm(const float3& v) {
+    return glm::vec3(v.x, v.y, v.z);
+}
+
+__host__ __device__ 
+inline float3 to_float3(const glm::vec3& v) {
+    return make_float3(v.x, v.y, v.z);
+}
+
 
 // Backward version of INVERSE 2D covariance matrix computation
 // (due to length launched as separate kernel before other 
@@ -225,8 +244,6 @@ __global__ void computeCov2DCUDA(int P,
         cov3D[2], cov3D[4], cov3D[5]
     );
 
-	float3 dL_dconic = { dL_dconics[4 * idx], dL_dconics[4 * idx + 1], dL_dconics[4 * idx + 3] };
-
 	//--------------------------------------------------
     // 1) world → camera
     //--------------------------------------------------
@@ -249,6 +266,8 @@ __global__ void computeCov2DCUDA(int P,
     // 3) moment matching（均值 + 协方差）
     //--------------------------------------------------
 	// 预计算常量
+	const int N_SAMPLES = NUM_STD_SAMPLES; // 采样点数(statistical_constants.cuh中定义)
+
     const float limx = 1.3f * tan_fovx;
     const float limy = 1.3f * tan_fovy;
     const float invN = 1.f / float(N_SAMPLES);
@@ -258,8 +277,20 @@ __global__ void computeCov2DCUDA(int P,
 
 	#pragma unroll
 	for (int s = 0; s < N_SAMPLES; ++s) {
-		// 1) xi = mu_c + L z_i
-		glm::vec3 x = mu_c + lowerTriMul(L, STANDARD_NORMAL_SAMPLES[s]);
+		// 1) xi = mu_cam + L z_i
+		// glm::vec3 x = mu_cam + lowerTriMul(L, BASE_SAMPLES_MAX[s]);
+		int baseIdx = 3 * s;  
+		glm::vec3 sample(
+			BASE_SAMPLES_MAX[baseIdx+0],
+			BASE_SAMPLES_MAX[baseIdx+1],
+			BASE_SAMPLES_MAX[baseIdx+2]
+		);
+
+		// 如果 lowerTriMul 已改成接受 glm::vec3 并返回 glm::vec3
+		glm::vec3 delta = lowerTriMul(L, sample);  
+		// glm::vec3 x     = mu_cam + delta;
+		glm::vec3 x = to_glm(mu_cam) + delta;
+
 
 		// 2) yi = p(xi) 并做 mask & clamp
 		float u, v; glm::mat2x3 J;
@@ -276,7 +307,7 @@ __global__ void computeCov2DCUDA(int P,
 	//--------------------------------------------------
 	// 4) 从累加的矩阵量计算 μ2d 和 Σ2d：mean2d = (u_bar, v_bar)， cov2d = (a, b, c)
 	//--------------------------------------------------
-	const float invN = 1.f / float(N_SAMPLES);
+	// const float invN = 1.f / float(N_SAMPLES);
 	float u_bar = sum_u * invN;            // E[u]
 	float v_bar = sum_v * invN;            // E[v]
 
@@ -332,8 +363,13 @@ __global__ void computeCov2DCUDA(int P,
 		#pragma unroll
 		for (int s = 0; s < N_SAMPLES; ++s)
 		{
-			glm::vec3 z = STANDARD_NORMAL_SAMPLES[s];
-			glm::vec3 x = mu_c + lowerTriMul(L, z);
+			float s0 = BASE_SAMPLES_MAX[3*s + 0];
+			float s1 = BASE_SAMPLES_MAX[3*s + 1];
+			float s2 = BASE_SAMPLES_MAX[3*s + 2];
+			glm::vec3 z(s0, s1, s2);
+
+			// glm::vec3 x = mu_cam + lowerTriMul(L, z);
+			glm::vec3 x = to_glm(mu_cam) + lowerTriMul(L, z);
 			float u,v; glm::mat2x3 J;
 			projectPerspMasked(x, h_x, h_y, limx, limy, u, v, J);
 	
@@ -376,7 +412,14 @@ __global__ void computeCov2DCUDA(int P,
 		dL_dcov[6*idx + 5] = dΣw[2][2];
 	
 		// 9) μ_c→μ_w
-		dL_dmeans[idx] += glm::transpose(W) * dL_dμc_loc;
+		// dL_dmeans[idx] += glm::transpose(W) * dL_dμc_loc;
+		// dL_dmeans[idx] += to_float3(glm::transpose(W) * dL_dμc_loc);
+		float3 inc = to_float3(glm::transpose(W) * dL_dμc_loc);
+		dL_dmeans[idx].x += inc.x;
+		dL_dmeans[idx].y += inc.y;
+		dL_dmeans[idx].z += inc.z;
+
+
 	}
 	else
 	{
