@@ -338,14 +338,14 @@ __global__ void computeCov2DCUDA(int P,
 		// ∂L/∂a = ∂L/∂A · ∂A/∂a + ∂L/∂B · ∂B/∂a + ∂L/∂C · ∂C/∂a
 		dL_da = denom2inv * (
 			-c*c * dL_dconic.x     // ∂A/∂a = -c² / denom²
-		+ 2*b*c * dL_dconic.y   // ∂B/∂a =  2bc / denom²
+		+ b*c * dL_dconic.y   // ∂B/∂a =  bc / denom²
 		+ (denom - a*c) * dL_dconic.z  // ∂C/∂a = (denom - ac)/denom²
 		);
 
 		// ∂L/∂c = ∂L/∂C · ∂C/∂c + ∂L/∂B · ∂B/∂c + ∂L/∂A · ∂A/∂c
 		dL_dc = denom2inv * (
 			-a*a * dL_dconic.z
-		+ 2*a*b * dL_dconic.y
+		+ a*b * dL_dconic.y  // ∂B/∂c = a*b / det^2
 		+ (denom - a*c) * dL_dconic.x
 		);
 
