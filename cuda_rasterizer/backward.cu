@@ -151,7 +151,7 @@ __device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::
 // -------- helpers for SL --------
 __device__ __forceinline__ void cholesky3x3(const glm::mat3& A, glm::mat3& L)
 {
-    // A 对称正定 → L 下三角；跟 forward 一致
+    // A symmetric positive definite → L lower triangular; same as forward
     const float eps = 1e-6f;
     L[0][0] = sqrtf(fmaxf(A[0][0], eps));
     L[1][0] = A[1][0] / L[0][0];
@@ -164,13 +164,13 @@ __device__ __forceinline__ void cholesky3x3(const glm::mat3& A, glm::mat3& L)
     float t22 = A[2][2] - L[2][0]*L[2][0] - L[2][1]*L[2][1];
     L[2][2] = sqrtf(fmaxf(t22, eps));
 
-    // 其余上三角清零
+    // other upper triangular zero
     L[0][1]=L[0][2]=L[1][2]=0.f;
 }
 
 __device__ __forceinline__ glm::vec3 lowerTriMul(const glm::mat3& L, const glm::vec3& z)
 {
-    // L 下三角 × 向量 z
+    // L lower triangular × vector z
     return glm::vec3(
         L[0][0]*z.x,
         L[1][0]*z.x + L[1][1]*z.y,
@@ -178,7 +178,7 @@ __device__ __forceinline__ glm::vec3 lowerTriMul(const glm::mat3& L, const glm::
     );
 }
 
-// —— 帮手：在透视投影中同时做 clamp 和 mask —— 
+// —— helper: clamp and mask in perspective projection —— 
 __device__ __forceinline__ void projectPerspMasked(
 	const glm::vec3& x,
 	const float  h_x, const float  h_y,
@@ -186,7 +186,7 @@ __device__ __forceinline__ void projectPerspMasked(
 	float& u,    float& v,
 	glm::mat2x3& J)
 {
-// pre‐clamp 坐标
+// pre‐clamp coordinates
 float px = x.x * (1.f / x.z);
 float py = x.y * (1.f / x.z);
 
@@ -194,13 +194,13 @@ float py = x.y * (1.f / x.z);
 float xm = (px < -limx || px > limx) ? 0.f : 1.f;
 float ym = (py < -limy || py > limy) ? 0.f : 1.f;
 
-// clamp 后再乘焦距
+// clamp and multiply by focal length
 float cpx = fminf(fmaxf(px, -limx), limx);
 float cpy = fminf(fmaxf(py, -limy), limy);
 u = h_x * cpx;
 v = h_y * cpy;
 
-// Jacobian 并打上 mask
+// Jacobian and mask
 float invZ = 1.f / x.z, invZ2 = invZ * invZ;
 J[0][0] =  h_x * invZ   * xm;  J[0][1] = 0.f;               J[0][2] = -h_x * x.x * invZ2 * xm;
 J[1][0] = 0.f;                 J[1][1] =  h_y * invZ   * ym; J[1][2] = -h_y * x.y * invZ2 * ym;
@@ -263,9 +263,9 @@ __global__ void computeCov2DCUDA(int P,
     cholesky3x3(Σc, L);
 
 	//--------------------------------------------------
-    // 3) moment matching（均值 + 协方差）
+    // 3) moment matching (mean + covariance)
     //--------------------------------------------------
-	// 预计算常量
+	// Precompute constants
 	const int N_SAMPLES = NUM_STD_SAMPLES; // 采样点数(statistical_constants.cuh中定义)
 
     const float limx = 1.3f * tan_fovx;
@@ -286,17 +286,17 @@ __global__ void computeCov2DCUDA(int P,
 			BASE_SAMPLES_MAX[baseIdx+2]
 		);
 
-		// 如果 lowerTriMul 已改成接受 glm::vec3 并返回 glm::vec3
+		// If lowerTriMul is modified to accept glm::vec3 and return glm::vec3
 		glm::vec3 delta = lowerTriMul(L, sample);  
 		// glm::vec3 x     = mu_cam + delta;
 		glm::vec3 x = to_glm(mu_cam) + delta;
 
 
-		// 2) yi = p(xi) 并做 mask & clamp
+		// 2) yi = p(xi) and mask & clamp
 		float u, v; glm::mat2x3 J;
 		projectPerspMasked(x, h_x, h_y, limx, limy, u, v, J);
 
-		// 3) 累加一阶矩与二阶矩
+		// 3) Accumulate first and second order moments
 		sum_u  += u;
 		sum_v  += v;
 		sum_uu += u * u;
@@ -305,7 +305,7 @@ __global__ void computeCov2DCUDA(int P,
 	}
 
 	//--------------------------------------------------
-	// 4) 从累加的矩阵量计算 μ2d 和 Σ2d：mean2d = (u_bar, v_bar)， cov2d = (a, b, c)
+	// 4) Calculate μ2d and Σ2d from accumulated matrix quantities: mean2d = (u_bar, v_bar), cov2d = (a, b, c)
 	//--------------------------------------------------
 	// const float invN = 1.f / float(N_SAMPLES);
 	float u_bar = sum_u * invN;            // E[u]
@@ -322,16 +322,17 @@ __global__ void computeCov2DCUDA(int P,
 	float c = ev2 - v_bar * v_bar + 0.3f;   // σ_y² + ε
 
 	//--------------------------------------------------
-	// 5) conic→(a,b,c) 的反传 
+	// 5) conic→(a,b,c)  backward
 	//--------------------------------------------------
 	float denom = a * c - b * b;
 	float dL_da = 0, dL_db = 0, dL_dc = 0;
 	float denom2inv = 1.0f / ((denom * denom) + 0.0000001f);
 
-	// 从 conic 提取 loss 梯度
+	// Extract loss gradient from conic
 	float3 dL_dconic = { dL_dconics[4*idx],
 						dL_dconics[4*idx+1],
-						dL_dconics[4*idx+3] };
+						dL_dconics[4*idx+2] }; 
+						// dL_dconics[4*idx+3] }; 
 
 	if (denom2inv != 0)
 	{
@@ -356,7 +357,7 @@ __global__ void computeCov2DCUDA(int P,
 		+ a*b * dL_dconic.z
 		);
 
-		// 7) 分摊到每个 y_i，再链到 x_i → μ_c, L
+		// 7) Apportioned to each y_i, then chain to x_i → μ_c, L
 		glm::vec3 dL_dμc_loc(0.f);
 		float dL_dL_loc[9] = {0};
 		const float factor = 2.f * invN;
@@ -383,7 +384,7 @@ __global__ void computeCov2DCUDA(int P,
 				J[0][2]*gu + J[1][2]*gv
 			);
 			dL_dμc_loc += grad_x;
-			// 下三角累加
+			// lower triangular accumulate
 			dL_dL_loc[0] += grad_x.x * z.x;
 			dL_dL_loc[3] += grad_x.y * z.x;
 			dL_dL_loc[4] += grad_x.y * z.y;
@@ -392,7 +393,7 @@ __global__ void computeCov2DCUDA(int P,
 			dL_dL_loc[8] += grad_x.z * z.z;
 		}
 	
-		// 8) L→Σ_c→Σ_w，同原 math_support.pdf 2.4+2.5
+		// 8) L→Σ_c→Σ_w, same as original math_support.pdf 2.4+2.5
 		glm::mat3 dL_dL_mat(
 		  dL_dL_loc[0], 0, 0,
 		  dL_dL_loc[3], dL_dL_loc[4], 0,
@@ -403,7 +404,7 @@ __global__ void computeCov2DCUDA(int P,
 		glm::mat3 dΣc     = 0.5f*(M + glm::transpose(M));
 		glm::mat3 dΣw     = glm::transpose(W) * dΣc * W;
 	
-		// 存回 Σ_w 梯度（6 元素）
+		// store Σ_w gradient (6 elements)
 		dL_dcov[6*idx + 0] = dΣw[0][0];
 		dL_dcov[6*idx + 1] = dΣw[0][1]*2.f;
 		dL_dcov[6*idx + 2] = dΣw[0][2]*2.f;
