@@ -190,7 +190,7 @@ __device__ __forceinline__ void projectPerspMasked(
 float px = x.x * (1.f / x.z);
 float py = x.y * (1.f / x.z);
 
-// mask factor：超出视锥外，梯度置 0
+// Mask factor: set gradient to 0 if outside the view frustum
 float xm = (px < -limx || px > limx) ? 0.f : 1.f;
 float ym = (py < -limy || py > limy) ? 0.f : 1.f;
 
@@ -266,7 +266,7 @@ __global__ void computeCov2DCUDA(int P,
     // 3) moment matching (mean + covariance)
     //--------------------------------------------------
 	// Precompute constants
-	const int N_SAMPLES = NUM_STD_SAMPLES; // 采样点数(statistical_constants.cuh中定义)
+	const int N_SAMPLES = NUM_STD_SAMPLES; // number of samples (statistical_constants.cuh)
 
     const float limx = 1.3f * tan_fovx;
     const float limy = 1.3f * tan_fovy;
@@ -316,7 +316,7 @@ __global__ void computeCov2DCUDA(int P,
 	float euv = sum_uv * invN;
 	float ev2 = sum_vv * invN;
 
-	// 方差与协方差
+	// variance and covariance
 	float a = eu2 - u_bar * u_bar + 0.3f;   // σ_x² + ε
 	float b = euv - u_bar * v_bar;          // cov_xy
 	float c = ev2 - v_bar * v_bar + 0.3f;   // σ_y² + ε
