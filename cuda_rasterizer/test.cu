@@ -90,7 +90,8 @@
          const float* view,
          const float* dL_dconics,
          float3* dL_dmeans,
-         float*  dL_dcov);
+         float*  dL_dcov,
+         const bool use_proj_mean);
  
  int main(int argc, char** argv) {
      // ——— 0. Read and copy stdnormal3D_samples.txt ———
@@ -179,7 +180,8 @@
          d_means, d_radii, d_cov3Ds,
          fx, fy, tan_fx, tan_fy,
          d_view, d_dLdConic,
-         d_dLdMeans, d_dLdCov);
+         d_dLdMeans, d_dLdCov,
+         true);
      CUDA_CHECK(cudaDeviceSynchronize());
      CUDA_CHECK(cudaGetLastError());
  

@@ -842,8 +842,7 @@ void BACKWARD::preprocess(
 		dL_dcov3D,
 		dL_dsh,
 		dL_dscale,
-		dL_drot,
-		use_proj_mean);
+		dL_drot);
 }
 
 void BACKWARD::render(
