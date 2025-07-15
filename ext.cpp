@@ -49,10 +49,24 @@ namespace {
             throw std::runtime_error("No samples found in " + path);
 
         // ---------- Copy to GPU constant ----------
-        cudaMemcpyToSymbol(BASE_SAMPLES_MAX, host.data(),
-                           N * 3 * sizeof(float), 0, cudaMemcpyHostToDevice);
-        cudaMemcpyToSymbol(NUM_STD_SAMPLES, &N,
-                           sizeof(int), 0, cudaMemcpyHostToDevice);
+        // cudaMemcpyToSymbol(BASE_SAMPLES_MAX, host.data(),
+        //                    N * 3 * sizeof(float), 0, cudaMemcpyHostToDevice);
+        // cudaMemcpyToSymbol(NUM_STD_SAMPLES, &N,
+        //                    sizeof(int), 0, cudaMemcpyHostToDevice);
+        cudaMemcpyToSymbol(
+            (const void*)BASE_SAMPLES_MAX,   // ← 符号 BASE_SAMPLES_MAX 的地址
+            host.data(),                     // ← host 端浮点数组指针
+            N * 3 * sizeof(float),           // ← 拷 N*3 个 float
+            0,
+            cudaMemcpyHostToDevice
+        );
+        cudaMemcpyToSymbol(
+            (const void*)&NUM_STD_SAMPLES,   // ← 符号 NUM_STD_SAMPLES 的地址
+            &N,                              // ← host 端的整数 N
+            sizeof(int),
+            0,
+            cudaMemcpyHostToDevice
+        );
 
         std_samples_loaded = true;                // Set, no more disk reads
     }
@@ -101,6 +115,7 @@ rasterize_gaussians_backward_autoload(
     const torch::Tensor& means3D,
     const torch::Tensor& radii,
     const torch::Tensor& colors,
+    const torch::Tensor& opacities,
     const torch::Tensor& scales,
     const torch::Tensor& rotations,
     const float          scale_modifier,
@@ -120,7 +135,7 @@ rasterize_gaussians_backward_autoload(
     const bool           debug)
 {
     load_std_samples_once();
-    return RasterizeGaussiansBackwardCUDA(background, means3D, radii, colors, scales, rotations,
+    return RasterizeGaussiansBackwardCUDA(background, means3D, radii, colors, opacities, scales, rotations,
                                           scale_modifier, cov3D_precomp, viewmatrix, projmatrix,
                                           tan_fovx, tan_fovy, dL_dout_color, sh, degree, campos,
                                           geomBuffer, R, binningBuffer, imageBuffer, debug);
