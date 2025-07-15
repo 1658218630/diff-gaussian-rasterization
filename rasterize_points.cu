@@ -23,6 +23,8 @@
 #include <fstream>
 #include <string>
 #include <functional>
+#include "cuda_rasterizer/statistical_constants.cuh"  
+
 
 std::function<char*(size_t N)> resizeFunctional(torch::Tensor& t) {
     auto lambda = [&t](size_t N) {
@@ -62,11 +64,12 @@ RasterizeGaussiansCUDA(
   const int H = image_height;
   const int W = image_width;
 
-  auto int_opts = means3D.options().dtype(torch::kInt32);
+//   auto int_opts = means3D.options().dtype(torch::kInt32);
   auto float_opts = means3D.options().dtype(torch::kFloat32);
 
   torch::Tensor out_color = torch::full({NUM_CHANNELS, H, W}, 0.0, float_opts);
-  torch::Tensor radii = torch::full({P}, 0, means3D.options().dtype(torch::kInt32));
+//   torch::Tensor radii = torch::full({P}, 0, means3D.options().dtype(	torch::kInt32));
+  torch::Tensor radii = torch::full({P}, 0.0f, means3D.options().dtype(torch::kFloat32));
   
   torch::Device device(torch::kCUDA);
   torch::TensorOptions options(torch::kByte);
@@ -108,7 +111,8 @@ RasterizeGaussiansCUDA(
 		tan_fovy,
 		prefiltered,
 		out_color.contiguous().data<float>(),
-		radii.contiguous().data<int>(),
+		// radii.contiguous().data<int>(),
+		radii.contiguous().data<float>(),
 		debug);
   }
   return std::make_tuple(rendered, out_color, radii, geomBuffer, binningBuffer, imgBuffer);
@@ -120,6 +124,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	const torch::Tensor& means3D,
 	const torch::Tensor& radii,
     const torch::Tensor& colors,
+	const torch::Tensor& opacities,
 	const torch::Tensor& scales,
 	const torch::Tensor& rotations,
 	const float scale_modifier,
@@ -176,6 +181,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	  tan_fovx,
 	  tan_fovy,
 	  radii.contiguous().data<int>(),
+	//   radii.contiguous().data<float>(),
 	  reinterpret_cast<char*>(geomBuffer.contiguous().data_ptr()),
 	  reinterpret_cast<char*>(binningBuffer.contiguous().data_ptr()),
 	  reinterpret_cast<char*>(imageBuffer.contiguous().data_ptr()),

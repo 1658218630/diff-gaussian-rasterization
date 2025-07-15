@@ -44,6 +44,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	const torch::Tensor& radii,
     const torch::Tensor& colors,
 	const torch::Tensor& scales,
+	const torch::Tensor& opacities,
 	const torch::Tensor& rotations,
 	const float scale_modifier,
 	const torch::Tensor& cov3D_precomp,

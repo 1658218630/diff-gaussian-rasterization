@@ -101,6 +101,7 @@ rasterize_gaussians_backward_autoload(
     const torch::Tensor& means3D,
     const torch::Tensor& radii,
     const torch::Tensor& colors,
+    const torch::Tensor& opacities,
     const torch::Tensor& scales,
     const torch::Tensor& rotations,
     const float          scale_modifier,
@@ -120,7 +121,7 @@ rasterize_gaussians_backward_autoload(
     const bool           debug)
 {
     load_std_samples_once();
-    return RasterizeGaussiansBackwardCUDA(background, means3D, radii, colors, scales, rotations,
+    return RasterizeGaussiansBackwardCUDA(background, means3D, radii, colors, opacities, scales, rotations,
                                           scale_modifier, cov3D_precomp, viewmatrix, projmatrix,
                                           tan_fovx, tan_fovy, dL_dout_color, sh, degree, campos,
                                           geomBuffer, R, binningBuffer, imageBuffer, debug);
