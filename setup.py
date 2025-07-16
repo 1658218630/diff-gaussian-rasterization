@@ -1,51 +1,51 @@
-#
-# Copyright (C) 2023, Inria
-# GRAPHDECO research group, https://team.inria.fr/graphdeco
-# All rights reserved.
-#
-# This software is free for non-commercial, research and evaluation use 
-# under the terms of the LICENSE.md file.
-#
-# For inquiries contact  george.drettakis@inria.fr
-#
+# setup.py  (放在项目根目录)
 
 from setuptools import setup
 from torch.utils.cpp_extension import CUDAExtension, BuildExtension
 import os
 
-here = os.path.dirname(os.path.abspath(__file__))
+# 1️⃣ CUDA 源文件及头文件所在目录
+cuda_src_dir = "cuda_rasterizer"          # 视你的项目结构调整
+third_party_glm = os.path.join("third_party", "glm")
+
+# 2️⃣ 列出所有 .cu / .cpp / .cxx 源文件
+sources = [
+    os.path.join(cuda_src_dir, "rasterizer_impl.cu"),
+    os.path.join(cuda_src_dir, "forward.cu"),
+    os.path.join(cuda_src_dir, "backward.cu"),
+    os.path.join(cuda_src_dir, "statistical_constants.cu"),
+    "rasterize_points.cu",
+    "ext.cpp",
+]
 
 setup(
     name="diff_gaussian_rasterization",
-    packages=['diff_gaussian_rasterization'],
+    packages=["diff_gaussian_rasterization"],
     ext_modules=[
         CUDAExtension(
             name="diff_gaussian_rasterization._C",
-            sources=[
-                "cuda_rasterizer/statistical_constants.cu",
-                "cuda_rasterizer/rasterizer_impl.cu",
-                "cuda_rasterizer/forward.cu",
-                "cuda_rasterizer/backward.cu",
-                "rasterize_points.cu",
-                "ext.cpp",
-            ],
-            include_dirs=[
-                os.path.join(here, "cuda_rasterizer"),
-                os.path.join(here, "third_party", "glm"),
-            ],
-            # NVCC: 开启设备代码重定位，加个优化等级
+            sources=sources,
+            # 3️⃣ 让 g++ / nvcc 都能找到 header
+            include_dirs=[cuda_src_dir, third_party_glm],
+            # 4️⃣ 关键编译/链接参数
             extra_compile_args={
-                "nvcc": [
-                    "-allow-unsupported-compiler",
-                    "-rdc=true",
+                "cxx": [
+                    "-std=c++17",
                     "-O3",
+                    f"-I{cuda_src_dir}",      # 冗余一份，保险起见
+                    f"-I{third_party_glm}",
                 ],
-                # CXX: 给 C++ 源也加优化
-                "cxx": ["-O3"],
+                "nvcc": [
+                    "-std=c++17",
+                    "-O3",
+                    "-rdc=true",              # 允许可重定位设备代码
+                    "--expt-relaxed-constexpr",
+                    f"-I{third_party_glm}",
+                ],
             },
-            # 链接时显式拉入 cudart 库，否则找不到 __cudaRegisterLinkedBinary
-            extra_link_args=["-lcudart", "-lcudadevrt"],
+            # 让 Torch 帮你做 device-link 阶段；编译器会自动加 -lcudadevrt
+            dlink=True,
         )
     ],
-    cmdclass={'build_ext': BuildExtension},
+    cmdclass={"build_ext": BuildExtension},
 )

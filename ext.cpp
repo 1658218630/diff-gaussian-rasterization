@@ -11,7 +11,7 @@
 #include <pybind11/numpy.h>
 #include <cuda_runtime.h>
 #include <vector>
-#include "statistical_constants.cuh"
+#include "cuda_rasterizer/statistical_constants.cuh"
 
 #include <fstream>          
 #include <string>           
