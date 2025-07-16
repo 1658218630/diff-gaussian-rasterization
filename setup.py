@@ -33,12 +33,18 @@ setup(
                 os.path.join(here, "cuda_rasterizer"),
                 os.path.join(here, "third_party", "glm"),
             ],
+            # NVCC: 开启设备代码重定位，加个优化等级
             extra_compile_args={
                 "nvcc": [
                     "-allow-unsupported-compiler",
                     "-rdc=true",
-                ]
+                    "-O3",
+                ],
+                # CXX: 给 C++ 源也加优化
+                "cxx": ["-O3"],
             },
+            # 链接时显式拉入 cudart 库，否则找不到 __cudaRegisterLinkedBinary
+            extra_link_args=["-lcudart", "-lcudadevrt"],
         )
     ],
     cmdclass={'build_ext': BuildExtension},
