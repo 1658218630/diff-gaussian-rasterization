@@ -218,9 +218,9 @@ py::array_t<float> get_samples_from_constant() {
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // ─── Forward / Backward bind to new auto‑load wrapper ───
     m.def("rasterize_gaussians", &rasterize_gaussians_autoload,
-          "Rasterize Gaussians forward (auto‑load std‑normal samples)");
+          "Rasterize_Gaussians_forward (auto-load std-normal samples)");
     m.def("rasterize_gaussians_backward", &rasterize_gaussians_backward_autoload,
-          "Rasterize Gaussians backward (auto‑load std‑normal samples)");
+          "Rasterize_Gaussians_backward (auto-load std-normal samples)");
 
     // ─── Other existing interfaces ───
     m.def("mark_visible", &markVisible);
